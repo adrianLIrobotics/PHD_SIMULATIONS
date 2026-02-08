@@ -4,10 +4,14 @@
 # - 2 plots per row
 # - detailed traces per policy
 # - Documentation page with robust math rendering (st.latex everywhere for equations)
+# - time-varying observed meta-parameters via optional m_obs_schedule in JSON
+# - Examples page with two sections:
+#   (A) Stick & Fork (10 variants)
+#   (B) Other stories (10 variants; some analogies, some single-policy)
 
 import json
 from dataclasses import dataclass
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional, Tuple
 
 import numpy as np
 import pandas as pd
@@ -74,13 +78,62 @@ def rel_attrib(c: np.ndarray) -> np.ndarray:
 
 
 # -----------------------------
+# Schedule utilities for time-varying observed meta-params
+# -----------------------------
+def clamp01(x: float) -> float:
+    return float(max(0.0, min(1.0, x)))
+
+
+def sanitize_schedule(raw_schedule: Any, meta_names: List[str]) -> List[Dict[str, Any]]:
+    if raw_schedule is None:
+        return []
+    if not isinstance(raw_schedule, list):
+        raise ValueError("m_obs_schedule must be a list of objects like {'t': 30, 'Efficiency': 0.5}.")
+
+    cleaned: List[Dict[str, Any]] = []
+    for item in raw_schedule:
+        if not isinstance(item, dict) or "t" not in item:
+            raise ValueError("Each schedule entry must be an object with at least key 't'.")
+        entry: Dict[str, Any] = {"t": int(item["t"])}
+        for m in meta_names:
+            if m in item:
+                entry[m] = clamp01(float(item[m]))
+        cleaned.append(entry)
+
+    cleaned.sort(key=lambda d: d["t"])
+    return cleaned
+
+
+def get_m_obs_at_time(m_obs_base: np.ndarray, schedule: List[Dict[str, Any]], meta_names: List[str], t: int) -> np.ndarray:
+    m_obs_t = m_obs_base.copy()
+    for entry in schedule:
+        if entry["t"] <= t:
+            for k, m in enumerate(meta_names):
+                if m in entry:
+                    m_obs_t[k] = float(entry[m])
+        else:
+            break
+    return m_obs_t
+
+
+def get_change_points(schedule: List[Dict[str, Any]]) -> List[int]:
+    return [int(e["t"]) for e in schedule] if schedule else []
+
+
+def draw_change_lines(ax, change_points: List[int]):
+    for cp in change_points:
+        ax.axvline(cp, linestyle=":", linewidth=1, alpha=0.6)
+
+
+# -----------------------------
 # Data structures
 # -----------------------------
 @dataclass
 class Policy:
     name: str
     m_pred: np.ndarray
-    m_obs: np.ndarray
+    m_obs_base: np.ndarray
+    m_obs_schedule: Optional[List[Dict[str, Any]]] = None
 
 
 @dataclass
@@ -99,26 +152,31 @@ class Model:
 # -----------------------------
 # Simulation
 # -----------------------------
-def simulate(policies: List[Policy], model: Model, steps: int) -> Dict[str, pd.DataFrame]:
+def simulate(policies: List[Policy], model: Model, steps: int) -> Tuple[Dict[str, pd.DataFrame], Dict[str, List[int]]]:
     K = len(model.meta_names)
     results: Dict[str, pd.DataFrame] = {}
+    change_points_by_policy: Dict[str, List[int]] = {}
 
     for pol in policies:
         # per-meta-parameter belief b_k = [p(T), p(D)]
         b = np.tile(np.array([0.5, 0.5], dtype=float), (K, 1))
         w = model.w0.copy()
 
+        schedule = sanitize_schedule(pol.m_obs_schedule, model.meta_names) if pol.m_obs_schedule else []
+        change_points_by_policy[pol.name] = get_change_points(schedule)
+
         rows = []
         for t in range(steps):
+            m_obs_t = get_m_obs_at_time(pol.m_obs_base, schedule, model.meta_names, t)
+
             pT_local = np.zeros(K, dtype=float)
             match_flags = np.zeros(K, dtype=bool)
 
             for k in range(K):
                 b_pred = markov_predict(b[k], model.T)
-                err = abs(float(pol.m_obs[k] - pol.m_pred[k]))
+                err = abs(float(m_obs_t[k] - pol.m_pred[k]))
                 match = err <= float(model.taus[k])
 
-                # Observation likelihood vector O(z) = [P(z|T), P(z|D)]^T
                 O = np.array([
                     model.p_match_T if match else 1.0 - model.p_match_T,
                     model.p_match_D if match else 1.0 - model.p_match_D
@@ -128,20 +186,18 @@ def simulate(policies: List[Policy], model: Model, steps: int) -> Dict[str, pd.D
                 pT_local[k] = b[k, 0]
                 match_flags[k] = match
 
-            # Global trust: attention-weighted aggregation of local trusts
             pT_global = float(np.dot(w, pT_local))
 
-            exm_val = exm(pol.m_obs, w)
+            exm_val = exm(m_obs_t, w)
             se_val = se_posterior(exm_val, pT_global, model.gamma)
 
-            e = pol.m_obs - pol.m_pred
+            e = m_obs_t - pol.m_pred
             c = abs_contrib(e, w)
             rho = rel_attrib(c)
 
-            # Weight calibration: w <- w + phi * rho * (SE - ExM) * g, with g = m_obs
             if model.adapt:
                 delta = se_val - exm_val
-                w = w + model.phi * rho * delta * pol.m_obs
+                w = w + model.phi * rho * delta * m_obs_t
                 w = normalize(np.clip(w, 0.0, None))
 
             row = {
@@ -154,7 +210,7 @@ def simulate(policies: List[Policy], model: Model, steps: int) -> Dict[str, pd.D
 
             for k, name in enumerate(model.meta_names):
                 row[f"m_pred_{name}"] = float(pol.m_pred[k])
-                row[f"m_obs_{name}"] = float(pol.m_obs[k])
+                row[f"m_obs_{name}"] = float(m_obs_t[k])
                 row[f"e_{name}"] = float(e[k])
                 row[f"abs_e_{name}"] = float(abs(e[k]))
                 row[f"match_{name}"] = bool(match_flags[k])
@@ -167,7 +223,7 @@ def simulate(policies: List[Policy], model: Model, steps: int) -> Dict[str, pd.D
 
         results[pol.name] = pd.DataFrame(rows)
 
-    return results
+    return results, change_points_by_policy
 
 
 # -----------------------------
@@ -186,22 +242,24 @@ def parse_csv_floats(text: str, K: int, fallback: float) -> np.ndarray:
     return np.array(vals, dtype=float)
 
 
-def clamp01(x: float) -> float:
-    return float(max(0.0, min(1.0, x)))
-
-
 def default_policies_json(meta_names: List[str]) -> str:
-    keys = meta_names[:]
-    while len(keys) < 3:
-        keys.append(f"m{len(keys)+1}")
-    e, c, tc = keys[0], keys[1], keys[2]
+    # keep the existing default behavior
+    e, c, tc = meta_names[0], meta_names[1], meta_names[2] if len(meta_names) >= 3 else "TaskCompletion"
     example = [
         {"name": "Fork",
          "m_pred": {e: 0.6, c: 0.8, tc: 1.0},
-         "m_obs":  {e: 0.6, c: 0.8, tc: 1.0}},
+         "m_obs":  {e: 0.6, c: 0.8, tc: 1.0},
+         "m_obs_schedule": [
+             {"t": 0, e: 0.6, c: 0.8, tc: 1.0},
+             {"t": 30, e: 0.3}
+         ]},
         {"name": "Sticks",
          "m_pred": {e: 0.6, c: 0.8, tc: 1.0},
-         "m_obs":  {e: 0.5, c: 0.2, tc: 0.7}},
+         "m_obs":  {e: 0.5, c: 0.2, tc: 0.7},
+         "m_obs_schedule": [
+             {"t": 0, e: 0.5, c: 0.2, tc: 0.7},
+             {"t": 20, tc: 0.4}
+         ]},
     ]
     return json.dumps(example, indent=2)
 
@@ -215,9 +273,11 @@ def parse_policies_from_json(raw: str, meta_names: List[str]) -> List[Policy]:
         name = str(item.get("name", "Unnamed"))
         mp = item.get("m_pred", {})
         mo = item.get("m_obs", {})
+        sched = item.get("m_obs_schedule", None)
+
         m_pred = np.array([clamp01(float(mp.get(m, 0.0))) for m in meta_names], dtype=float)
-        m_obs  = np.array([clamp01(float(mo.get(m, 0.0))) for m in meta_names], dtype=float)
-        policies.append(Policy(name=name, m_pred=m_pred, m_obs=m_obs))
+        m_obs_base = np.array([clamp01(float(mo.get(m, 0.0))) for m in meta_names], dtype=float)
+        policies.append(Policy(name=name, m_pred=m_pred, m_obs_base=m_obs_base, m_obs_schedule=sched))
     return policies
 
 
@@ -227,10 +287,9 @@ def make_policy_colors(policy_names: List[str]) -> Dict[str, Any]:
 
 
 # -----------------------------
-# Documentation page (robust math rendering)
+# Documentation page (UNCHANGED TEXT)
 # -----------------------------
 def render_docs():
-
     st.title("Documentation: Terminology & Equations")
 
     st.header("What is the outcome of this simulator?")
@@ -300,7 +359,6 @@ def render_docs():
         "- **Weight evolution** shows how attention shifts in response to bad experiences.\n\n"
         "Together, these traces form an *explanatory narrative* of decision-making under uncertainty."
     )
-
 
     st.header("1) Core objects")
 
@@ -393,15 +451,15 @@ def render_docs():
     st.subheader("Distrust penalty signal")
     st.latex(r"SE(\pi)-\mathrm{ExM}(\pi)=(1-p_T(\pi))\big(\gamma-\mathrm{ExM}(\pi)\big)")
     st.markdown(
-    "- **Interpretation:** this term measures how much lack of trust *spoiled* the experience.\n"
-    "- **ExM** answers: *How good was the result?*\n"
-    "- **SE** answers: *How good did it feel overall?*\n"
-    "- When trust is high, $SE \\approx \\mathrm{ExM}$ and this term is near zero.\n"
-    "- When trust is low, $SE < \\mathrm{ExM}$ because uncertainty and doubt degrade the experience.\n"
-    "- When $SE > \\mathrm{ExM}$, high trust and confidence *amplify* the experience, making it feel better than what the outcome alone would justify.\n"
-    "- This difference is the **epistemic degradation of experience**: the cost of acting without confidence.\n"
-    "- It is **not** an expectation-vs-reality prediction error; it reflects uncertainty, not performance."
-)
+        "- **Interpretation:** this term measures how much lack of trust *spoiled* the experience.\n"
+        "- **ExM** answers: *How good was the result?*\n"
+        "- **SE** answers: *How good did it feel overall?*\n"
+        "- When trust is high, $SE \\approx \\mathrm{ExM}$ and this term is near zero.\n"
+        "- When trust is low, $SE < \\mathrm{ExM}$ because uncertainty and doubt degrade the experience.\n"
+        "- When $SE > \\mathrm{ExM}$, high trust and confidence *amplify* the experience, making it feel better than what the outcome alone would justify.\n"
+        "- This difference is the **epistemic degradation of experience**: the cost of acting without confidence.\n"
+        "- It is **not** an expectation-vs-reality prediction error; it reflects uncertainty, not performance."
+    )
 
     st.divider()
     st.header("7) Error attribution (explainability)")
@@ -416,29 +474,14 @@ def render_docs():
     st.divider()
     st.header("8) Weight calibration (attention adaptation) used in the simulator")
 
-    st.markdown(
-        "- Weight calibration is **event-triggered**, not continuous.\n"
-        "- Adaptation is activated only when subjective experience is degraded relative to the observed evaluative outcome:\n"
-    )
-    st.latex(r"SE(\pi)-\mathrm{ExM}(\pi)<0")
-    st.markdown(
-        "- This condition indicates that uncertainty or lack of trust has negatively affected the experience.\n"
-        "- The system does **not** adapt weights merely because a prediction error exists.\n"
-        "- Weight adaptation occurs **only when the error meaningfully impacts experience**, ensuring stability and interpretability."
-    )
-
     st.latex(r"w_k\leftarrow w_k+\phi\,\rho_k(\pi)\,\big(SE(\pi)-\mathrm{ExM}(\pi)\big)\,g_k")
     st.latex(r"g_k=m_k^{obs}(\pi)")
     st.latex(r"w\leftarrow\frac{\max(w,0)}{\mathbf 1^\top \max(w,0)}")
-
     st.markdown(
-        "- $\\phi$ is the learning rate controlling the speed of attention adaptation.\n"
-        "- $\\rho_k(\\pi)$ focuses adaptation on the meta-parameters most responsible for the mismatch.\n"
-        "- $g_k$ is a simple sensitivity proxy: meta-parameters with higher observed values exert stronger influence.\n"
-        "- The final normalization step ensures all attention weights remain nonnegative and sum to one."
+        "- $\\phi$ is the learning rate.\n"
+        "- $g_k$ is a simple sensitivity proxy: higher observed value gets stronger influence.\n"
+        "- Final line clips weights nonnegative and renormalizes so $\\sum_k w_k=1$."
     )
-
-    
 
     st.divider()
     st.header("9) Simulator workflow (conceptual pipeline)")
@@ -457,16 +500,467 @@ def render_docs():
 
 
 # -----------------------------
+# Examples library page (TWO SECTIONS)
+# -----------------------------
+def render_examples():
+    st.title("Examples (JSON Library)")
+    st.markdown(
+        "Two sections:\n"
+        "1) **Stick & Fork** (10 variants)\n"
+        "2) **Other stories** (10 variants: some analogies, some single-policy baselines)\n\n"
+        "Click **Load into Simulator** to paste the JSON into the simulator editor."
+    )
+
+    if "policies_json" not in st.session_state:
+        st.session_state.policies_json = None
+
+    def render_example_block(title: str, story: str, obj: Any, key_prefix: str):
+        json_text = json.dumps(obj, indent=2)
+        with st.expander(title, expanded=False):
+            st.markdown(f"**Story:** {story}")
+            c1, c2 = st.columns([1, 1])
+            with c1:
+                if st.button("Load into Simulator ✅", key=f"{key_prefix}_load"):
+                    st.session_state.policies_json = json_text
+                    st.success("Loaded! Go to **Simulator** and press **Run simulation ✅**.")
+            with c2:
+                st.caption("Copy-paste JSON below:")
+            st.code(json_text, language="json")
+
+    # ---------- SECTION 1: Stick & Fork (10) ----------
+    st.header("Section A — Stick & Fork (10 variants)")
+    st.caption("All examples are Fork vs Sticks, but with different prediction quality, schedules, and failure modes.")
+
+    stick_fork_examples: List[Dict[str, Any]] = []
+
+    # 1) Your baseline
+    stick_fork_examples.append({
+        "title": "A1) Baseline: Fork strong, Sticks weak, Fork fatigue at t=30",
+        "story": "Fork matches prediction, then Efficiency drops at t=30. Sticks start low comfort and completion drops at t=20.",
+        "json": [
+            {
+                "name": "Fork",
+                "m_pred": {"Efficiency": 0.6, "Comfort": 0.8, "TaskCompletion": 1.0},
+                "m_obs":  {"Efficiency": 0.6, "Comfort": 0.8, "TaskCompletion": 1.0},
+                "m_obs_schedule": [
+                    {"t": 0, "Efficiency": 0.6, "Comfort": 0.8, "TaskCompletion": 1.0},
+                    {"t": 30, "Efficiency": 0.3}
+                ]
+            },
+            {
+                "name": "Sticks",
+                "m_pred": {"Efficiency": 0.6, "Comfort": 0.8, "TaskCompletion": 1.0},
+                "m_obs":  {"Efficiency": 0.5, "Comfort": 0.2, "TaskCompletion": 0.7},
+                "m_obs_schedule": [
+                    {"t": 0, "Efficiency": 0.5, "Comfort": 0.2, "TaskCompletion": 0.7},
+                    {"t": 20, "TaskCompletion": 0.4}
+                ]
+            }
+        ]
+    })
+
+    # 2) Fork predicted too optimistic (analogy oversells)
+    stick_fork_examples.append({
+        "title": "A2) Analogy oversells Fork (pred too optimistic)",
+        "story": "Fork predicted super high comfort/efficiency, but observed is just 'good'. Trust drops even though outcome is decent.",
+        "json": [
+            {
+                "name": "Fork",
+                "m_pred": {"Efficiency": 0.9, "Comfort": 0.95, "TaskCompletion": 1.0},
+                "m_obs":  {"Efficiency": 0.65, "Comfort": 0.75, "TaskCompletion": 1.0}
+            },
+            {
+                "name": "Sticks",
+                "m_pred": {"Efficiency": 0.6, "Comfort": 0.8, "TaskCompletion": 1.0},
+                "m_obs":  {"Efficiency": 0.5, "Comfort": 0.2, "TaskCompletion": 0.7}
+            }
+        ]
+    })
+
+    # 3) Sticks improve with training
+    stick_fork_examples.append({
+        "title": "A3) Sticks improve after training at t=25",
+        "story": "Sticks start uncomfortable but comfort improves after practice; trust should recover.",
+        "json": [
+            {
+                "name": "Fork",
+                "m_pred": {"Efficiency": 0.6, "Comfort": 0.8, "TaskCompletion": 1.0},
+                "m_obs":  {"Efficiency": 0.6, "Comfort": 0.8, "TaskCompletion": 1.0}
+            },
+            {
+                "name": "Sticks",
+                "m_pred": {"Efficiency": 0.55, "Comfort": 0.50, "TaskCompletion": 0.9},
+                "m_obs":  {"Efficiency": 0.50, "Comfort": 0.20, "TaskCompletion": 0.9},
+                "m_obs_schedule": [
+                    {"t": 0, "Efficiency": 0.50, "Comfort": 0.20, "TaskCompletion": 0.9},
+                    {"t": 25, "Comfort": 0.55}
+                ]
+            }
+        ]
+    })
+
+    # 4) Fork breaks (completion drops)
+    stick_fork_examples.append({
+        "title": "A4) Fork breaks at t=12 (TaskCompletion collapses)",
+        "story": "Everything is great until the fork bends; completion drops sharply and dominates ExM/SE.",
+        "json": [
+            {
+                "name": "Fork",
+                "m_pred": {"Efficiency": 0.6, "Comfort": 0.8, "TaskCompletion": 1.0},
+                "m_obs":  {"Efficiency": 0.6, "Comfort": 0.8, "TaskCompletion": 1.0},
+                "m_obs_schedule": [
+                    {"t": 0, "Efficiency": 0.6, "Comfort": 0.8, "TaskCompletion": 1.0},
+                    {"t": 12, "TaskCompletion": 0.3}
+                ]
+            },
+            {
+                "name": "Sticks",
+                "m_pred": {"Efficiency": 0.55, "Comfort": 0.35, "TaskCompletion": 0.85},
+                "m_obs":  {"Efficiency": 0.50, "Comfort": 0.25, "TaskCompletion": 0.80}
+            }
+        ]
+    })
+
+    # 5) Slow drift: fork efficiency slowly drops (fatigue)
+    stick_fork_examples.append({
+        "title": "A5) Fork fatigue drift (Efficiency steps down)",
+        "story": "Fork’s efficiency decreases in steps; trust drops if prediction didn’t anticipate it.",
+        "json": [
+            {
+                "name": "Fork",
+                "m_pred": {"Efficiency": 0.7, "Comfort": 0.8, "TaskCompletion": 1.0},
+                "m_obs":  {"Efficiency": 0.7, "Comfort": 0.8, "TaskCompletion": 1.0},
+                "m_obs_schedule": [
+                    {"t": 0, "Efficiency": 0.7, "Comfort": 0.8, "TaskCompletion": 1.0},
+                    {"t": 10, "Efficiency": 0.6},
+                    {"t": 20, "Efficiency": 0.5},
+                    {"t": 30, "Efficiency": 0.4}
+                ]
+            },
+            {
+                "name": "Sticks",
+                "m_pred": {"Efficiency": 0.55, "Comfort": 0.40, "TaskCompletion": 0.9},
+                "m_obs":  {"Efficiency": 0.50, "Comfort": 0.25, "TaskCompletion": 0.85}
+            }
+        ]
+    })
+
+    # 6) Comfort erosion for sticks (stress)
+    stick_fork_examples.append({
+        "title": "A6) Sticks stress accumulation (Comfort erodes further)",
+        "story": "Sticks start low comfort and it gets worse over time (frustration / stress).",
+        "json": [
+            {
+                "name": "Fork",
+                "m_pred": {"Efficiency": 0.6, "Comfort": 0.8, "TaskCompletion": 1.0},
+                "m_obs":  {"Efficiency": 0.6, "Comfort": 0.8, "TaskCompletion": 1.0}
+            },
+            {
+                "name": "Sticks",
+                "m_pred": {"Efficiency": 0.55, "Comfort": 0.35, "TaskCompletion": 0.9},
+                "m_obs":  {"Efficiency": 0.50, "Comfort": 0.30, "TaskCompletion": 0.85},
+                "m_obs_schedule": [
+                    {"t": 0, "Efficiency": 0.50, "Comfort": 0.30, "TaskCompletion": 0.85},
+                    {"t": 15, "Comfort": 0.20},
+                    {"t": 30, "Comfort": 0.10}
+                ]
+            }
+        ]
+    })
+
+    # 7) Both succeed, but experience differs (comfort vs efficiency trade)
+    stick_fork_examples.append({
+        "title": "A7) Both succeed, but Fork is smoother (experience gap)",
+        "story": "Task completion stays high for both; sticks are less comfortable and slightly less efficient.",
+        "json": [
+            {
+                "name": "Fork",
+                "m_pred": {"Efficiency": 0.65, "Comfort": 0.80, "TaskCompletion": 0.95},
+                "m_obs":  {"Efficiency": 0.64, "Comfort": 0.82, "TaskCompletion": 0.95}
+            },
+            {
+                "name": "Sticks",
+                "m_pred": {"Efficiency": 0.65, "Comfort": 0.80, "TaskCompletion": 0.95},
+                "m_obs":  {"Efficiency": 0.55, "Comfort": 0.25, "TaskCompletion": 0.95}
+            }
+        ]
+    })
+
+    # 8) Fork predicted wrong dimension (comfort predicted, but efficiency mismatch)
+    stick_fork_examples.append({
+        "title": "A8) Fork mismatch in Efficiency only (comfort ok)",
+        "story": "Fork comfort is fine, but efficiency is worse than predicted; attribution should point to Efficiency.",
+        "json": [
+            {
+                "name": "Fork",
+                "m_pred": {"Efficiency": 0.80, "Comfort": 0.80, "TaskCompletion": 1.0},
+                "m_obs":  {"Efficiency": 0.55, "Comfort": 0.80, "TaskCompletion": 1.0}
+            },
+            {
+                "name": "Sticks",
+                "m_pred": {"Efficiency": 0.55, "Comfort": 0.40, "TaskCompletion": 0.85},
+                "m_obs":  {"Efficiency": 0.50, "Comfort": 0.25, "TaskCompletion": 0.80}
+            }
+        ]
+    })
+
+    # 9) Sticks predicted pessimistic (pleasant surprise)
+    stick_fork_examples.append({
+        "title": "A9) Sticks predicted pessimistic, observed better (pleasant surprise)",
+        "story": "Analogy underestimates sticks, so trust can rise (errors are small or even 'better than predicted' in some dims).",
+        "json": [
+            {
+                "name": "Fork",
+                "m_pred": {"Efficiency": 0.65, "Comfort": 0.80, "TaskCompletion": 1.0},
+                "m_obs":  {"Efficiency": 0.65, "Comfort": 0.80, "TaskCompletion": 1.0}
+            },
+            {
+                "name": "Sticks",
+                "m_pred": {"Efficiency": 0.30, "Comfort": 0.20, "TaskCompletion": 0.60},
+                "m_obs":  {"Efficiency": 0.50, "Comfort": 0.45, "TaskCompletion": 0.80}
+            }
+        ]
+    })
+
+    # 10) Chaotic sticks: completion oscillates (modeled as steps)
+    stick_fork_examples.append({
+        "title": "A10) Sticks unstable skill: completion drops then recovers",
+        "story": "Completion dips (bad attempt), then recovers (good attempt). Shows non-stationary reliability.",
+        "json": [
+            {
+                "name": "Fork",
+                "m_pred": {"Efficiency": 0.60, "Comfort": 0.80, "TaskCompletion": 1.0},
+                "m_obs":  {"Efficiency": 0.60, "Comfort": 0.80, "TaskCompletion": 1.0}
+            },
+            {
+                "name": "Sticks",
+                "m_pred": {"Efficiency": 0.55, "Comfort": 0.35, "TaskCompletion": 0.90},
+                "m_obs":  {"Efficiency": 0.50, "Comfort": 0.25, "TaskCompletion": 0.90},
+                "m_obs_schedule": [
+                    {"t": 0, "Efficiency": 0.50, "Comfort": 0.25, "TaskCompletion": 0.90},
+                    {"t": 12, "TaskCompletion": 0.40},
+                    {"t": 24, "TaskCompletion": 0.85}
+                ]
+            }
+        ]
+    })
+
+    for idx, ex in enumerate(stick_fork_examples, start=1):
+        render_example_block(ex["title"], ex["story"], ex["json"], key_prefix=f"A{idx}")
+
+    st.divider()
+
+    # ---------- SECTION 2: Other stories (10) ----------
+    st.header("Section B — Other stories (10 variants)")
+    st.caption("Some are analogies (two policies), others are single-policy cases (no analogy).")
+
+    other_examples: List[Dict[str, Any]] = []
+
+    # B1) Car vs Bicycle commute (analogy)
+    other_examples.append({
+        "title": "B1) Commute analogy: Car vs Bicycle",
+        "story": "Car predicted comfy and fast; bicycle predicted slower but pleasant. Observations can flip the story if traffic hits.",
+        "json": [
+            {
+                "name": "Car",
+                "m_pred": {"Efficiency": 0.85, "Comfort": 0.80, "TaskCompletion": 1.0},
+                "m_obs":  {"Efficiency": 0.85, "Comfort": 0.80, "TaskCompletion": 1.0},
+                "m_obs_schedule": [
+                    {"t": 0, "Efficiency": 0.85, "Comfort": 0.80, "TaskCompletion": 1.0},
+                    {"t": 15, "Efficiency": 0.40, "Comfort": 0.55}  # traffic jam
+                ]
+            },
+            {
+                "name": "Bicycle",
+                "m_pred": {"Efficiency": 0.55, "Comfort": 0.70, "TaskCompletion": 1.0},
+                "m_obs":  {"Efficiency": 0.55, "Comfort": 0.70, "TaskCompletion": 1.0}
+            }
+        ]
+    })
+
+    # B2) Spain vs China travel (analogy)
+    other_examples.append({
+        "title": "B2) Travel analogy: Spain vs China (jetlag hits at t=5)",
+        "story": "Both trips complete, but comfort drops for long-haul travel due to jetlag and language friction.",
+        "json": [
+            {
+                "name": "SpainTrip",
+                "m_pred": {"Efficiency": 0.70, "Comfort": 0.85, "TaskCompletion": 1.0},
+                "m_obs":  {"Efficiency": 0.68, "Comfort": 0.83, "TaskCompletion": 1.0}
+            },
+            {
+                "name": "ChinaTrip",
+                "m_pred": {"Efficiency": 0.70, "Comfort": 0.85, "TaskCompletion": 1.0},
+                "m_obs":  {"Efficiency": 0.70, "Comfort": 0.85, "TaskCompletion": 1.0},
+                "m_obs_schedule": [
+                    {"t": 0, "Efficiency": 0.70, "Comfort": 0.85, "TaskCompletion": 1.0},
+                    {"t": 5, "Comfort": 0.35}
+                ]
+            }
+        ]
+    })
+
+    # B3) New job onboarding (single policy)
+    other_examples.append({
+        "title": "B3) Single policy: New job onboarding (confidence grows)",
+        "story": "One policy only. Starts uncomfortable, then comfort increases after iteration 20 (you get used to it).",
+        "json": [
+            {
+                "name": "Onboarding",
+                "m_pred": {"Efficiency": 0.55, "Comfort": 0.60, "TaskCompletion": 0.95},
+                "m_obs":  {"Efficiency": 0.55, "Comfort": 0.35, "TaskCompletion": 0.95},
+                "m_obs_schedule": [
+                    {"t": 0, "Efficiency": 0.55, "Comfort": 0.35, "TaskCompletion": 0.95},
+                    {"t": 20, "Comfort": 0.65}
+                ]
+            }
+        ]
+    })
+
+    # B4) Public speaking (single policy)
+    other_examples.append({
+        "title": "B4) Single policy: Public speaking (stress accumulation)",
+        "story": "Performance is okay, but comfort erodes over repeated exposure (unless you model training).",
+        "json": [
+            {
+                "name": "PublicSpeaking",
+                "m_pred": {"Efficiency": 0.65, "Comfort": 0.70, "TaskCompletion": 0.95},
+                "m_obs":  {"Efficiency": 0.65, "Comfort": 0.70, "TaskCompletion": 0.95},
+                "m_obs_schedule": [
+                    {"t": 0, "Efficiency": 0.65, "Comfort": 0.70, "TaskCompletion": 0.95},
+                    {"t": 10, "Comfort": 0.55},
+                    {"t": 20, "Comfort": 0.40},
+                    {"t": 30, "Comfort": 0.30}
+                ]
+            }
+        ]
+    })
+
+    # B5) Laptop purchase (analogy: Mac vs Gaming PC)
+    other_examples.append({
+        "title": "B5) Buying analogy: Mac vs Gaming PC",
+        "story": "Mac predicted high comfort, moderate efficiency. PC predicted high efficiency but lower comfort (noise/heat).",
+        "json": [
+            {
+                "name": "Mac",
+                "m_pred": {"Efficiency": 0.70, "Comfort": 0.90, "TaskCompletion": 1.0},
+                "m_obs":  {"Efficiency": 0.68, "Comfort": 0.92, "TaskCompletion": 1.0}
+            },
+            {
+                "name": "GamingPC",
+                "m_pred": {"Efficiency": 0.90, "Comfort": 0.75, "TaskCompletion": 1.0},
+                "m_obs":  {"Efficiency": 0.92, "Comfort": 0.55, "TaskCompletion": 1.0}
+            }
+        ]
+    })
+
+    # B6) Robot navigation policy: safe detour vs risky shortcut (analogy)
+    other_examples.append({
+        "title": "B6) Robot navigation analogy: SafeDetour vs RiskyShortcut",
+        "story": "Shortcut is predicted efficient; observed comfort/safety collapses (think near-misses) even if completion stays high.",
+        "json": [
+            {
+                "name": "SafeDetour",
+                "m_pred": {"Efficiency": 0.55, "Comfort": 0.80, "TaskCompletion": 1.0},
+                "m_obs":  {"Efficiency": 0.52, "Comfort": 0.82, "TaskCompletion": 1.0}
+            },
+            {
+                "name": "RiskyShortcut",
+                "m_pred": {"Efficiency": 0.80, "Comfort": 0.80, "TaskCompletion": 1.0},
+                "m_obs":  {"Efficiency": 0.78, "Comfort": 0.20, "TaskCompletion": 1.0}
+            }
+        ]
+    })
+
+    # B7) Single policy: cloud offloading (network outage)
+    other_examples.append({
+        "title": "B7) Single policy: Cloud offload (network outage at t=18)",
+        "story": "Looks great until network quality collapses; efficiency and completion take a hit at t=18.",
+        "json": [
+            {
+                "name": "CloudOffload",
+                "m_pred": {"Efficiency": 0.85, "Comfort": 0.75, "TaskCompletion": 1.0},
+                "m_obs":  {"Efficiency": 0.85, "Comfort": 0.75, "TaskCompletion": 1.0},
+                "m_obs_schedule": [
+                    {"t": 0, "Efficiency": 0.85, "Comfort": 0.75, "TaskCompletion": 1.0},
+                    {"t": 18, "Efficiency": 0.35, "TaskCompletion": 0.60}
+                ]
+            }
+        ]
+    })
+
+    # B8) Diet vs Workout (analogy)
+    other_examples.append({
+        "title": "B8) Lifestyle analogy: Diet vs Workout",
+        "story": "Workout predicted efficient for results but low comfort initially; comfort improves later with habit formation.",
+        "json": [
+            {
+                "name": "DietPlan",
+                "m_pred": {"Efficiency": 0.60, "Comfort": 0.70, "TaskCompletion": 0.90},
+                "m_obs":  {"Efficiency": 0.58, "Comfort": 0.65, "TaskCompletion": 0.88}
+            },
+            {
+                "name": "WorkoutPlan",
+                "m_pred": {"Efficiency": 0.75, "Comfort": 0.40, "TaskCompletion": 0.90},
+                "m_obs":  {"Efficiency": 0.75, "Comfort": 0.25, "TaskCompletion": 0.90},
+                "m_obs_schedule": [
+                    {"t": 0, "Efficiency": 0.75, "Comfort": 0.25, "TaskCompletion": 0.90},
+                    {"t": 25, "Comfort": 0.55}
+                ]
+            }
+        ]
+    })
+
+    # B9) Single policy: meditation (slow improvement)
+    other_examples.append({
+        "title": "B9) Single policy: Meditation (comfort rises slowly)",
+        "story": "Predicted modest benefits; observed comfort gradually rises (habit).",
+        "json": [
+            {
+                "name": "Meditation",
+                "m_pred": {"Efficiency": 0.45, "Comfort": 0.60, "TaskCompletion": 0.85},
+                "m_obs":  {"Efficiency": 0.45, "Comfort": 0.45, "TaskCompletion": 0.85},
+                "m_obs_schedule": [
+                    {"t": 0, "Efficiency": 0.45, "Comfort": 0.45, "TaskCompletion": 0.85},
+                    {"t": 15, "Comfort": 0.55},
+                    {"t": 30, "Comfort": 0.65}
+                ]
+            }
+        ]
+    })
+
+    # B10) Electric scooter vs walking (analogy)
+    other_examples.append({
+        "title": "B10) Micro-mobility analogy: E-scooter vs Walking",
+        "story": "Scooter predicted efficient and comfortable; comfort drops due to rain and bumps at t=12.",
+        "json": [
+            {
+                "name": "EScooter",
+                "m_pred": {"Efficiency": 0.80, "Comfort": 0.75, "TaskCompletion": 1.0},
+                "m_obs":  {"Efficiency": 0.80, "Comfort": 0.75, "TaskCompletion": 1.0},
+                "m_obs_schedule": [
+                    {"t": 0, "Efficiency": 0.80, "Comfort": 0.75, "TaskCompletion": 1.0},
+                    {"t": 12, "Comfort": 0.35}
+                ]
+            },
+            {
+                "name": "Walking",
+                "m_pred": {"Efficiency": 0.55, "Comfort": 0.70, "TaskCompletion": 1.0},
+                "m_obs":  {"Efficiency": 0.55, "Comfort": 0.70, "TaskCompletion": 1.0}
+            }
+        ]
+    })
+
+    for idx, ex in enumerate(other_examples, start=1):
+        render_example_block(ex["title"], ex["story"], ex["json"], key_prefix=f"B{idx}")
+
+
+# -----------------------------
 # Simulator page
 # -----------------------------
 def render_simulator():
     st.title("Subjetive experience simulator")
-    st.markdown(
-        "Edit predicted/observed evaluative meta-parameters in the **Policies JSON** and click **Run simulation ✅**. "
-        "Plots are shown **two per row** and traces are expandable."
-    )
 
-    # Session state for run control + JSON persistence
     if "run_clicked" not in st.session_state:
         st.session_state.run_clicked = True
     if "policies_json" not in st.session_state:
@@ -521,7 +1015,11 @@ def render_simulator():
             if st.session_state.policies_json is None:
                 st.session_state.policies_json = default_policies_json(meta_names)
 
-            st.caption("Edit **m_pred** and **m_obs** here. Values must be in [0,1]. Keys must match meta names.")
+            st.caption(
+                "Edit **m_pred** and **m_obs** here. Values must be in [0,1]. Keys must match meta names.\n"
+                "Optional: add **m_obs_schedule** to change observed meta-params over time.\n"
+                "Tip: go to **Examples** for copy-paste templates."
+            )
             policies_json = st.text_area("Policies JSON", value=st.session_state.policies_json, height=280)
             st.session_state.policies_json = policies_json
 
@@ -558,7 +1056,7 @@ def render_simulator():
         st.error(f"Policies JSON error: {e}")
         st.stop()
 
-    results = simulate(policies, model, int(steps))
+    results, change_points_by_policy = simulate(policies, model, int(steps))
     policy_names = list(results.keys())
     colors = make_policy_colors(policy_names)
 
@@ -568,22 +1066,20 @@ def render_simulator():
     def fig_small_tall():
         return plt.subplots(figsize=(4.8, 2.6))
 
-    # Summary table
     st.subheader("Final summary")
     summary = []
     for name, df in results.items():
         last = df.iloc[-1]
+        cps = change_points_by_policy.get(name, [])
         summary.append({
             "Policy": name,
             "ExM_final": round(float(last["ExM"]), 4),
             "SE_final": round(float(last["SE"]), 4),
             "pT_global_final": round(float(last["pT_global"]), 4),
             "SE_minus_ExM_final": round(float(last["SE_minus_ExM"]), 4),
+            "change_points": ", ".join(map(str, cps)) if cps else "-"
         })
     st.dataframe(pd.DataFrame(summary).sort_values("SE_final", ascending=False), use_container_width=True)
-
-    # Plots: 2 per row
-    st.subheader("Plots (2 per row)")
 
     colA, colB = st.columns(2)
 
@@ -592,6 +1088,7 @@ def render_simulator():
         for name, df in results.items():
             ax.plot(df["t"], df["SE"], label=f"{name} SE", color=colors[name])
             ax.plot(df["t"], df["ExM"], linestyle="--", alpha=0.6, color=colors[name], label=f"{name} ExM")
+            draw_change_lines(ax, change_points_by_policy.get(name, []))
         ax.set_title("SE vs ExM")
         ax.set_xlabel("t")
         ax.legend()
@@ -601,6 +1098,7 @@ def render_simulator():
         fig, ax = fig_small_tall()
         for name, df in results.items():
             ax.plot(df["t"], df["pT_global"], label=name, color=colors[name])
+            draw_change_lines(ax, change_points_by_policy.get(name, []))
         ax.set_ylim(0, 1)
         ax.set_title("Global trust $p_T(\\pi)$")
         ax.set_xlabel("t")
@@ -613,6 +1111,7 @@ def render_simulator():
         fig, ax = fig_small()
         for name, df in results.items():
             ax.plot(df["t"], df["SE_minus_ExM"], label=name, color=colors[name])
+            draw_change_lines(ax, change_points_by_policy.get(name, []))
         ax.axhline(0, color="gray", linestyle=":", linewidth=1)
         ax.set_title("Distrust penalty: SE − ExM")
         ax.set_xlabel("t")
@@ -625,13 +1124,13 @@ def render_simulator():
         dfp = results[pick]
         for m in meta_names:
             ax.plot(dfp["t"], dfp[f"w_{m}"], label=f"w_{m}")
+        draw_change_lines(ax, change_points_by_policy.get(pick, []))
         ax.set_title(f"Weight evolution (policy: {pick})")
         ax.set_xlabel("t")
         ax.set_ylim(0, 1)
         ax.legend()
         st.pyplot(fig, use_container_width=True)
 
-    # Local trust plots (2 per row)
     st.subheader("Local trust per meta-parameter (2 per row)")
     pairs = [meta_names[i:i + 2] for i in range(0, len(meta_names), 2)]
     for pair in pairs:
@@ -642,13 +1141,30 @@ def render_simulator():
                 fig, ax = fig_small()
                 for name, df in results.items():
                     ax.plot(df["t"], df[f"pT_{m}"], label=name, color=colors[name])
+                    draw_change_lines(ax, change_points_by_policy.get(name, []))
                 ax.set_ylim(0, 1)
                 ax.set_title(f"Local trust in {m}")
                 ax.set_xlabel("t")
                 ax.legend()
                 st.pyplot(fig, use_container_width=True)
 
-    # Attribution bars at final timestep (2 per row, per policy)
+    st.subheader("Observed meta-parameters over time (2 per row)")
+    pairs = [meta_names[i:i + 2] for i in range(0, len(meta_names), 2)]
+    for pair in pairs:
+        c1, c2 = st.columns(2)
+        for idx, m in enumerate(pair):
+            target_col = c1 if idx == 0 else c2
+            with target_col:
+                fig, ax = fig_small()
+                for name, df in results.items():
+                    ax.plot(df["t"], df[f"m_obs_{m}"], label=name, color=colors[name])
+                    draw_change_lines(ax, change_points_by_policy.get(name, []))
+                ax.set_ylim(0, 1)
+                ax.set_title(f"Observed {m} (m_obs)")
+                ax.set_xlabel("t")
+                ax.legend()
+                st.pyplot(fig, use_container_width=True)
+
     st.subheader("Attribution at final timestep (2 per row)")
     policy_pairs = [policy_names[i:i + 2] for i in range(0, len(policy_names), 2)]
     for pair in policy_pairs:
@@ -674,7 +1190,6 @@ def render_simulator():
                 ax.set_xticklabels(meta_names, rotation=25, ha="right")
                 st.pyplot(fig, use_container_width=True)
 
-    # Detailed traces
     st.subheader("Detailed traces (expandable)")
     for name, df in results.items():
         with st.expander(f"Trace table: {name}", expanded=False):
@@ -690,9 +1205,11 @@ st.set_page_config(page_title="SE & Trust Simulator", layout="wide")
 
 with st.sidebar:
     st.markdown("## Navigation")
-    page = st.radio("Go to", ["Simulator", "Documentation"], index=0)
+    page = st.radio("Go to", ["Simulator", "Documentation", "Examples (JSON Library)"], index=0)
 
 if page == "Documentation":
     render_docs()
+elif page == "Examples (JSON Library)":
+    render_examples()
 else:
     render_simulator()

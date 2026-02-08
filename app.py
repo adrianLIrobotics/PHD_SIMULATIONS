@@ -3,7 +3,7 @@
 # - JSON policies editor
 # - 2 plots per row
 # - detailed traces per policy
-# - Documentation page with terminology + equations
+# - Documentation page with robust math rendering (st.latex everywhere for equations)
 
 import json
 from dataclasses import dataclass
@@ -115,7 +115,6 @@ def simulate(policies: List[Policy], model: Model, steps: int) -> Dict[str, pd.D
 
             for k in range(K):
                 b_pred = markov_predict(b[k], model.T)
-
                 err = abs(float(pol.m_obs[k] - pol.m_pred[k]))
                 match = err <= float(model.taus[k])
 
@@ -126,11 +125,10 @@ def simulate(policies: List[Policy], model: Model, steps: int) -> Dict[str, pd.D
                 ], dtype=float)
 
                 b[k] = hmm_correct(b_pred, O)
-
                 pT_local[k] = b[k, 0]
                 match_flags[k] = match
 
-            # Global trust is an attention-weighted aggregation of local trusts
+            # Global trust: attention-weighted aggregation of local trusts
             pT_global = float(np.dot(w, pT_local))
 
             exm_val = exm(pol.m_obs, w)
@@ -193,12 +191,10 @@ def clamp01(x: float) -> float:
 
 
 def default_policies_json(meta_names: List[str]) -> str:
-    # Default example assumes >= 3 meta-params for a nice demo
     keys = meta_names[:]
     while len(keys) < 3:
         keys.append(f"m{len(keys)+1}")
     e, c, tc = keys[0], keys[1], keys[2]
-
     example = [
         {"name": "Fork",
          "m_pred": {e: 0.6, c: 0.8, tc: 1.0},
@@ -231,149 +227,232 @@ def make_policy_colors(policy_names: List[str]) -> Dict[str, Any]:
 
 
 # -----------------------------
-# Docs page
+# Documentation page (robust math rendering)
 # -----------------------------
 def render_docs():
-    st.title("📚 Documentation: Terminology & Equations")
+
+    st.title("Documentation: Terminology & Equations")
+
+    st.header("What is the outcome of this simulator?")
 
     st.markdown(
-        """
-This page documents the terminology and equations used in the simulator.
-The goal is to keep **value (what you care about)** separate from **epistemics (what is reliable)**,
-while still letting epistemics modulate experience.
-
----
-"""
+        "The simulator produces a **dynamic trace of subjective experience** for one or more policies. "
+        "For each policy, it shows how:\n"
+        "- evaluative outcomes (meta-utility),\n"
+        "- epistemic trust (local and global), and\n"
+        "- attention over evaluative dimensions\n"
+        "co-evolve over repeated executions.\n\n"
+        "The primary outcome of the simulator is **not a best policy**, but an explanation of *why* "
+        "certain policies feel better or worse over time, even when their observable outcomes are similar."
     )
 
-    st.header("Core objects")
+    st.divider()
 
-    st.markdown("### Meta-parameter vector")
-    st.latex(r"m(\pi) \in [0,1]^K,\quad m(\pi)=\big(m_1(\pi),\dots,m_K(\pi)\big)")
+    st.header("Policies")
+
     st.markdown(
-        """
-- \(m(\pi)\) is the evaluative **meta-parameter vector** for policy \(\pi\).
-- Each component (e.g., efficiency, comfort, completion) is normalized to \([0,1]\).
-"""
+        "A **policy** $\\pi$ represents a concrete way of acting in the world (e.g., using a fork versus using sticks). "
+        "Each policy is evaluated along a fixed set of **meta-parameters** that describe *how the action is experienced*, "
+        "not just whether the task succeeds.\n\n"
+        "For each policy, the simulator distinguishes between:\n"
+        "- **Predicted evaluative meta-parameters** $\\hat m(\\pi)$: what the agent expects based on analogy or prior knowledge.\n"
+        "- **Observed evaluative meta-parameters** $m^{obs}(\\pi)$: what is actually measured after executing the policy."
     )
 
-    st.markdown("### Predicted vs observed")
-    st.latex(r"\hat m(\pi)\; \text{(predicted)} \qquad m^{obs}(\pi)\; \text{(observed)}")
+    st.divider()
 
-    st.header("Meta-utility (observed evaluative score)")
+    st.header("Analogy")
 
-    st.latex(r"\mathrm{ExM}(\pi)=\sum_{k=1}^K w_k \, m_k^{obs}(\pi)")
     st.markdown(
-        """
-- \(\mathrm{ExM}(\pi)\) is the **observed meta-utility**.
-- It says: “Given what happened, how good was it under current attention weights \(w\)?”
-"""
+        "**Analogy** is used as an *evaluative prior*, not as a hard model of the environment.\n\n"
+        "An analogy proposes that a new policy $\\pi$ will *feel similar* to a known reference, "
+        "by predicting its evaluative meta-parameters $\\hat m(\\pi)$. "
+        "This prediction does **not** need to be correct in all dimensions; "
+        "it is a hypothesis that must be evaluated through experience.\n\n"
+        "Crucially, an analogy can be:\n"
+        "- **Good at the ground level** (task success, reward),\n"
+        "- but **poor at the meta level** if the resulting experience violates comfort, safety, or trust constraints.\n\n"
+        "The simulator demonstrates how such analogies are accepted, weakened, or rejected "
+        "based on their *subjective experiential consequences*."
     )
 
-    st.header("Prediction error and evidence")
+    st.divider()
 
+    st.header("What the simulator is not")
+
+    st.markdown(
+        "- It is **not** a planner or a reinforcement learning algorithm.\n"
+        "- It does **not** search for optimal actions.\n"
+        "- It does **not** assume that higher reward always implies better experience.\n\n"
+        "Instead, the simulator focuses on **explainability**: "
+        "making explicit how trust, uncertainty, and attention shape subjective experience over time."
+    )
+
+    st.divider()
+
+    st.header("Reading the plots")
+
+    st.markdown(
+        "- **ExM** shows how good the observable outcome was under current priorities.\n"
+        "- **SE** shows how good the experience felt once trust and uncertainty are taken into account.\n"
+        "- **SE − ExM** visualizes epistemic degradation (or, in extended models, amplification).\n"
+        "- **Local trust plots** show which evaluative dimensions are considered reliable.\n"
+        "- **Weight evolution** shows how attention shifts in response to bad experiences.\n\n"
+        "Together, these traces form an *explanatory narrative* of decision-making under uncertainty."
+    )
+
+
+    st.header("1) Core objects")
+
+    st.subheader("Meta-parameter vector")
+    st.latex(r"m(\pi)\in[0,1]^K")
+    st.latex(r"m(\pi)=\big(m_1(\pi),\dots,m_K(\pi)\big)")
+    st.markdown(
+        "- **Meaning:** evaluative meta-parameters for policy $\\pi$ (e.g., efficiency, comfort, task completion).\n"
+        "- **Range:** each component is normalized to $[0,1]$.\n"
+        "- **Dimension:** $K$ is the number of meta-parameters."
+    )
+
+    st.subheader("Predicted vs observed")
+    st.latex(r"\hat m(\pi)\quad \text{(predicted evaluative meta-parameters)}")
+    st.latex(r"m^{obs}(\pi)\quad \text{(observed evaluative meta-parameters)}")
+    st.markdown(
+        "- $\\hat m(\\pi)$ is what an analogy / prior expects.\n"
+        "- $m^{obs}(\\pi)$ is what you actually measure after execution."
+    )
+
+    st.divider()
+    st.header("2) Meta-utility (observed evaluative score)")
+
+    st.latex(r"\mathrm{ExM}(\pi)=\sum_{k=1}^{K} w_k\,m_k^{obs}(\pi)")
+    st.latex(r"w\in[0,1]^K,\qquad \sum_{k=1}^{K} w_k=1")
+    st.markdown(
+        "- **Meaning:** a weighted evaluation of what happened.\n"
+        "- $w$ is the **attention / priority vector** over meta-parameters.\n"
+        "- ExM is *not* trust — it is value under observed outcomes."
+    )
+
+    st.divider()
+    st.header("3) Prediction error and evidence")
+
+    st.subheader("Prediction error per meta-parameter")
     st.latex(r"e_k(\pi)=m_k^{obs}(\pi)-\hat m_k(\pi)")
     st.markdown(
-        """
-- \(e_k\) is the **prediction error** per meta-parameter.
-- Error is **not weighted** by attention. That preserves epistemic meaning.
-"""
+        "- **Meaning:** expectation vs reality along dimension $k$.\n"
+        "- In the simulator, evidence is derived from $|e_k|$."
     )
 
-    st.latex(r"z_k = \begin{cases}\text{match} & |e_k|\le\tau_k\\ \text{mismatch} & |e_k|>\tau_k\end{cases}")
+    st.subheader("Evidence extraction (match / mismatch)")
+    st.latex(r"z_k=\begin{cases}\text{match} & |e_k|\le\tau_k\\ \text{mismatch} & |e_k|>\tau_k\end{cases}")
     st.markdown(
-        """
-- \(z_k\) is the **evidence** extracted from error magnitude via a threshold \(\tau_k\).
-- Evidence drives trust updates.
-"""
+        "- $\\tau_k$ is a tolerance threshold per dimension.\n"
+        "- Evidence drives trust, not value."
     )
 
-    st.header("Local trust per meta-parameter (Markov/HMM)")
+    st.divider()
+    st.header("4) Local trust per meta-parameter (Markov / HMM)")
 
-    st.markdown("### Trust state and belief")
-    st.latex(r"X_t^k\in\{T,D\},\qquad b_t^k=\begin{bmatrix}P(X_t^k=T)\\P(X_t^k=D)\end{bmatrix}")
+    st.subheader("Trust state and belief")
+    st.latex(r"X_t^k\in\{T,D\}")
+    st.latex(r"b_t^k=\begin{bmatrix}P(X_t^k=T)\\P(X_t^k=D)\end{bmatrix}")
+    st.markdown("- Each meta-parameter has its own trust belief (local trust).")
 
-    st.markdown("### Markov prediction")
+    st.subheader("Trust transition matrix")
+    st.latex(r"\mathbf T=\begin{bmatrix}P(T\to T) & P(T\to D)\\P(D\to T) & P(D\to D)\end{bmatrix}")
+    st.markdown("- This is a **2-state Markov transition matrix** (a Markov chain over trust states).")
+
+    st.subheader("Prediction step (no evidence)")
     st.latex(r"b_{t}^{k-}=\mathbf T^\top b_{t-1}^k")
-    st.markdown("### Correction with evidence likelihood")
-    st.latex(r"b_t^k \propto \mathbf O(z_k)\odot b_t^{k-},\qquad b_t^k=\frac{\mathbf O(z_k)\odot b_t^{k-}}{\mathbf 1^\top(\mathbf O(z_k)\odot b_t^{k-})}")
+    st.markdown("- This propagates belief forward even without observations.")
 
+    st.subheader("Correction step (evidence likelihood + normalization)")
+    st.latex(r"\mathbf O(z_k)=\begin{bmatrix}P(z_k\mid T)\\P(z_k\mid D)\end{bmatrix}")
+    st.latex(r"b_t^k\propto \mathbf O(z_k)\odot b_t^{k-}")
+    st.latex(r"b_t^k=\frac{\mathbf O(z_k)\odot b_t^{k-}}{\mathbf 1^\top\left(\mathbf O(z_k)\odot b_t^{k-}\right)}")
+    st.markdown("- $\\odot$ denotes element-wise multiplication; denominator performs normalization.")
+
+    st.divider()
+    st.header("5) Global trust over policy")
+
+    st.latex(r"p_T^k(t)=P(X_t^k=T)")
+    st.latex(r"p_T(\pi)=\sum_{k=1}^{K} w_k\,p_T^k(t)")
     st.markdown(
-        """
-- Local trust estimates reliability **per dimension**.
-- \(\mathbf T\) is the **trust transition matrix**.
-- \(\mathbf O(z_k)\) is the **observation likelihood vector** \([P(z_k|T), P(z_k|D)]^\top\).
-"""
+        "- **Meaning:** global trust in policy $\\pi$ is attention-weighted local trust.\n"
+        "- This gives explainability: which dimensions are reducing trust?"
     )
 
-    st.header("Global trust over policy")
+    st.divider()
+    st.header("6) Posterior subjective experience")
 
-    st.latex(r"p_T(\pi)=\sum_{k=1}^K w_k\, p_T^k,\qquad p_T^k = P(X^k=T)")
+    st.latex(r"SE(\pi)=\mathrm{ExM}(\pi)\,p_T(\pi)+\gamma\,\big(1-p_T(\pi)\big),\quad \gamma<0")
     st.markdown(
-        """
-- Global trust is an **aggregation** of local trusts, weighted by current attention.
-- This makes policy trust interpretable (“which dimensions are dragging trust down?”).
-"""
+        "- $\\gamma$ is the **distrust penalty**: how bad it feels to proceed when you don't trust.\n"
+        "- If $p_T(\\pi)=1$, then $SE(\\pi)=\\mathrm{ExM}(\\pi)$."
     )
 
-    st.header("Posterior subjective experience")
-
-    st.latex(r"SE(\pi)=\mathrm{ExM}(\pi)\,p_T(\pi)+\gamma\,(1-p_T(\pi)),\quad \gamma<0")
-    st.markdown(
-        """
-- \(\gamma\) is a **distrust penalty** (“If I don’t trust it, how bad does it feel to do it anyway?”).
-- When trust is high, \(SE \approx \mathrm{ExM}\).
-- When trust is low, the penalty dominates and \(SE\) can become negative (depending on \(\gamma\)).
-"""
-    )
-
-    st.header("Distrust penalty signal")
-
+    st.subheader("Distrust penalty signal")
     st.latex(r"SE(\pi)-\mathrm{ExM}(\pi)=(1-p_T(\pi))\big(\gamma-\mathrm{ExM}(\pi)\big)")
     st.markdown(
-        """
-- This term is **not** expectation-vs-reality.
-- It measures how much epistemic distrust degraded experience relative to observed evaluative quality.
-"""
-    )
+    "- **Interpretation:** this term measures how much lack of trust *spoiled* the experience.\n"
+    "- **ExM** answers: *How good was the result?*\n"
+    "- **SE** answers: *How good did it feel overall?*\n"
+    "- When trust is high, $SE \\approx \\mathrm{ExM}$ and this term is near zero.\n"
+    "- When trust is low, $SE < \\mathrm{ExM}$ because uncertainty and doubt degrade the experience.\n"
+    "- When $SE > \\mathrm{ExM}$, high trust and confidence *amplify* the experience, making it feel better than what the outcome alone would justify.\n"
+    "- This difference is the **epistemic degradation of experience**: the cost of acting without confidence.\n"
+    "- It is **not** an expectation-vs-reality prediction error; it reflects uncertainty, not performance."
+)
 
-    st.header("Error attribution (explainability)")
+    st.divider()
+    st.header("7) Error attribution (explainability)")
 
     st.latex(r"c_k(\pi)=w_k\,|e_k(\pi)|")
     st.latex(r"\rho_k(\pi)=\frac{c_k(\pi)}{\sum_j c_j(\pi)}")
     st.markdown(
-        """
-- \(c_k\): **absolute contribution** of dimension \(k\) to mismatch, given attention.
-- \(\rho_k\): **relative attribution** (fraction of total mismatch).
-"""
+        "- $c_k$ is **absolute contribution** to mismatch given what you care about.\n"
+        "- $\\rho_k$ is **relative attribution** (fraction of total mismatch)."
     )
 
-    st.header("Weight calibration (attention adaptation) used in the simulator")
+    st.divider()
+    st.header("8) Weight calibration (attention adaptation) used in the simulator")
 
-    st.latex(r"w_k \leftarrow w_k + \phi \,\rho_k(\pi)\,\big(SE(\pi)-\mathrm{ExM}(\pi)\big)\,g_k")
-    st.latex(r"g_k = m_k^{obs}(\pi)\quad \text{(simple sensitivity proxy)}")
     st.markdown(
-        """
-- \(\phi\) is the **global learning rate**.
-- \(\rho_k\) makes calibration focus on the **dominant culprits** (explainability → learning).
-- After update we clip to nonnegative and renormalize \(w\) so \(\sum w = 1\).
-"""
+        "- Weight calibration is **event-triggered**, not continuous.\n"
+        "- Adaptation is activated only when subjective experience is degraded relative to the observed evaluative outcome:\n"
+    )
+    st.latex(r"SE(\pi)-\mathrm{ExM}(\pi)<0")
+    st.markdown(
+        "- This condition indicates that uncertainty or lack of trust has negatively affected the experience.\n"
+        "- The system does **not** adapt weights merely because a prediction error exists.\n"
+        "- Weight adaptation occurs **only when the error meaningfully impacts experience**, ensuring stability and interpretability."
     )
 
-    st.header("How to use the simulator")
+    st.latex(r"w_k\leftarrow w_k+\phi\,\rho_k(\pi)\,\big(SE(\pi)-\mathrm{ExM}(\pi)\big)\,g_k")
+    st.latex(r"g_k=m_k^{obs}(\pi)")
+    st.latex(r"w\leftarrow\frac{\max(w,0)}{\mathbf 1^\top \max(w,0)}")
 
     st.markdown(
-        """
-1. Define meta-parameters (names), initial weights \(w\), and thresholds \(\tau\).  
-2. Define policies in JSON with `m_pred` and `m_obs`.  
-3. Run multiple iterations to see how trust and weights evolve.  
-4. Use plots:
-   - **SE vs ExM**: whether distrust is depressing experience.
-   - **SE−ExM**: distrust penalty magnitude over time.
-   - **Local trust**: which dimensions are reliable/unreliable.
-   - **Weights**: calibration dynamics.
-   - **Attribution bars**: what drove mismatch at the last step.
-"""
+        "- $\\phi$ is the learning rate controlling the speed of attention adaptation.\n"
+        "- $\\rho_k(\\pi)$ focuses adaptation on the meta-parameters most responsible for the mismatch.\n"
+        "- $g_k$ is a simple sensitivity proxy: meta-parameters with higher observed values exert stronger influence.\n"
+        "- The final normalization step ensures all attention weights remain nonnegative and sum to one."
+    )
+
+    
+
+    st.divider()
+    st.header("9) Simulator workflow (conceptual pipeline)")
+
+    st.markdown("At each iteration:")
+    st.markdown(
+        "1. Compute prediction errors $|e_k|$ from $m^{obs}$ and $\\hat m$.\n"
+        "2. Convert errors into evidence $z_k$ using thresholds $\\tau_k$.\n"
+        "3. Update local trust beliefs with Markov prediction + evidence correction.\n"
+        "4. Aggregate global trust $p_T(\\pi)$ from local trusts using current weights $w$.\n"
+        "5. Compute observed meta-utility $\\mathrm{ExM}$.\n"
+        "6. Compute subjective experience $SE$ using distrust penalty $\\gamma$.\n"
+        "7. Attribute mismatch to dimensions ($c_k$, $\\rho_k$).\n"
+        "8. Optionally calibrate weights $w$."
     )
 
 
@@ -381,9 +460,9 @@ while still letting epistemics modulate experience.
 # Simulator page
 # -----------------------------
 def render_simulator():
-    st.title("🖤 SE + Trust Simulator")
+    st.title("Subjetive experience simulator")
     st.markdown(
-        "Edit predicted/observed evaluative meta-parameters in the **Policies JSON** and click **Run simulation**. "
+        "Edit predicted/observed evaluative meta-parameters in the **Policies JSON** and click **Run simulation ✅**. "
         "Plots are shown **two per row** and traces are expandable."
     )
 
@@ -601,10 +680,7 @@ def render_simulator():
         with st.expander(f"Trace table: {name}", expanded=False):
             st.dataframe(df, use_container_width=True)
 
-    st.caption(
-        "Edit obs/pred in JSON (sidebar). Click **Run simulation**. "
-        "Docs are available from the sidebar page selector."
-    )
+    st.caption("Docs are available from the sidebar navigation selector.")
 
 
 # -----------------------------

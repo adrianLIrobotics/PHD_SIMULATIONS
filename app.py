@@ -146,6 +146,7 @@ class Model:
     p_match_D: float
     gamma: float
     phi: float
+    rigidity: float   # NEW
     adapt: bool
 
 
@@ -195,9 +196,18 @@ def simulate(policies: List[Policy], model: Model, steps: int) -> Tuple[Dict[str
             c = abs_contrib(e, w)
             rho = rel_attrib(c)
 
+            # Weight calibration (attention adaptation)
             if model.adapt:
                 delta = se_val - exm_val
-                w = w + model.phi * rho * delta * m_obs_t
+
+                # Candidate update (your original rule)
+                w_candidate = w + model.phi * rho * delta * m_obs_t
+                w_candidate = normalize(np.clip(w_candidate, 0.0, None))
+
+                # NEW: rigidity blending
+                # rigidity=1 => keep old weights, rigidity=0 => take candidate fully
+                r = float(np.clip(model.rigidity, 0.0, 1.0))
+                w = r * w + (1.0 - r) * w_candidate
                 w = normalize(np.clip(w, 0.0, None))
 
             row = {
@@ -243,7 +253,6 @@ def parse_csv_floats(text: str, K: int, fallback: float) -> np.ndarray:
 
 
 def default_policies_json(meta_names: List[str]) -> str:
-    # keep the existing default behavior
     e, c, tc = meta_names[0], meta_names[1], meta_names[2] if len(meta_names) >= 3 else "TaskCompletion"
     example = [
         {"name": "Fork",
@@ -287,7 +296,7 @@ def make_policy_colors(policy_names: List[str]) -> Dict[str, Any]:
 
 
 # -----------------------------
-# Documentation page (UNCHANGED TEXT)
+# Documentation page (ADD ONLY; do not delete existing)
 # -----------------------------
 def render_docs():
     st.title("Documentation: Terminology & Equations")
@@ -474,6 +483,7 @@ def render_docs():
     st.divider()
     st.header("8) Weight calibration (attention adaptation) used in the simulator")
 
+    # YOUR EXISTING DOC (kept)
     st.latex(r"w_k\leftarrow w_k+\phi\,\rho_k(\pi)\,\big(SE(\pi)-\mathrm{ExM}(\pi)\big)\,g_k")
     st.latex(r"g_k=m_k^{obs}(\pi)")
     st.latex(r"w\leftarrow\frac{\max(w,0)}{\mathbf 1^\top \max(w,0)}")
@@ -481,6 +491,19 @@ def render_docs():
         "- $\\phi$ is the learning rate.\n"
         "- $g_k$ is a simple sensitivity proxy: higher observed value gets stronger influence.\n"
         "- Final line clips weights nonnegative and renormalizes so $\\sum_k w_k=1$."
+    )
+
+    # NEW: add rigidity without deleting old
+    st.subheader("Rigidity (inertia) parameter")
+    st.latex(r"r\in[0,1]\quad\text{(rigidity)}")
+    st.latex(r"w_{\text{cand}} \leftarrow \frac{\max\!\left(w+\phi\,\rho(\pi)\,(SE-\mathrm{ExM})\,g,\;0\right)}{\mathbf 1^\top \max\!\left(w+\phi\,\rho(\pi)\,(SE-\mathrm{ExM})\,g,\;0\right)}")
+    st.latex(r"w \leftarrow r\,w + (1-r)\,w_{\text{cand}}")
+    st.latex(r"w\leftarrow\frac{\max(w,0)}{\mathbf 1^\top \max(w,0)}")
+    st.markdown(
+        "- **Meaning:** rigidity controls how reluctant the agent is to change attention weights.\n"
+        "- If $r=1$, weights stay essentially fixed (fully rigid).\n"
+        "- If $r=0$, the update is fully applied (fully flexible).\n"
+        "- This makes adaptation smoother and prevents large weight swings from a single bad episode."
     )
 
     st.divider()
@@ -495,7 +518,7 @@ def render_docs():
         "5. Compute observed meta-utility $\\mathrm{ExM}$.\n"
         "6. Compute subjective experience $SE$ using distrust penalty $\\gamma$.\n"
         "7. Attribute mismatch to dimensions ($c_k$, $\\rho_k$).\n"
-        "8. Optionally calibrate weights $w$."
+        "8. Optionally calibrate weights $w$ (optionally regulated by rigidity $r$)."
     )
 
 
@@ -533,7 +556,6 @@ def render_examples():
 
     stick_fork_examples: List[Dict[str, Any]] = []
 
-    # 1) Your baseline
     stick_fork_examples.append({
         "title": "A1) Baseline: Fork strong, Sticks weak, Fork fatigue at t=30",
         "story": "Fork matches prediction, then Efficiency drops at t=30. Sticks start low comfort and completion drops at t=20.",
@@ -559,7 +581,6 @@ def render_examples():
         ]
     })
 
-    # 2) Fork predicted too optimistic (analogy oversells)
     stick_fork_examples.append({
         "title": "A2) Analogy oversells Fork (pred too optimistic)",
         "story": "Fork predicted super high comfort/efficiency, but observed is just 'good'. Trust drops even though outcome is decent.",
@@ -577,7 +598,6 @@ def render_examples():
         ]
     })
 
-    # 3) Sticks improve with training
     stick_fork_examples.append({
         "title": "A3) Sticks improve after training at t=25",
         "story": "Sticks start uncomfortable but comfort improves after practice; trust should recover.",
@@ -599,7 +619,6 @@ def render_examples():
         ]
     })
 
-    # 4) Fork breaks (completion drops)
     stick_fork_examples.append({
         "title": "A4) Fork breaks at t=12 (TaskCompletion collapses)",
         "story": "Everything is great until the fork bends; completion drops sharply and dominates ExM/SE.",
@@ -621,7 +640,6 @@ def render_examples():
         ]
     })
 
-    # 5) Slow drift: fork efficiency slowly drops (fatigue)
     stick_fork_examples.append({
         "title": "A5) Fork fatigue drift (Efficiency steps down)",
         "story": "Fork’s efficiency decreases in steps; trust drops if prediction didn’t anticipate it.",
@@ -645,7 +663,6 @@ def render_examples():
         ]
     })
 
-    # 6) Comfort erosion for sticks (stress)
     stick_fork_examples.append({
         "title": "A6) Sticks stress accumulation (Comfort erodes further)",
         "story": "Sticks start low comfort and it gets worse over time (frustration / stress).",
@@ -668,7 +685,6 @@ def render_examples():
         ]
     })
 
-    # 7) Both succeed, but experience differs (comfort vs efficiency trade)
     stick_fork_examples.append({
         "title": "A7) Both succeed, but Fork is smoother (experience gap)",
         "story": "Task completion stays high for both; sticks are less comfortable and slightly less efficient.",
@@ -686,7 +702,6 @@ def render_examples():
         ]
     })
 
-    # 8) Fork predicted wrong dimension (comfort predicted, but efficiency mismatch)
     stick_fork_examples.append({
         "title": "A8) Fork mismatch in Efficiency only (comfort ok)",
         "story": "Fork comfort is fine, but efficiency is worse than predicted; attribution should point to Efficiency.",
@@ -704,10 +719,9 @@ def render_examples():
         ]
     })
 
-    # 9) Sticks predicted pessimistic (pleasant surprise)
     stick_fork_examples.append({
         "title": "A9) Sticks predicted pessimistic, observed better (pleasant surprise)",
-        "story": "Analogy underestimates sticks, so trust can rise (errors are small or even 'better than predicted' in some dims).",
+        "story": "Analogy underestimates sticks, so trust can rise (errors are small or even better than predicted).",
         "json": [
             {
                 "name": "Fork",
@@ -722,7 +736,6 @@ def render_examples():
         ]
     })
 
-    # 10) Chaotic sticks: completion oscillates (modeled as steps)
     stick_fork_examples.append({
         "title": "A10) Sticks unstable skill: completion drops then recovers",
         "story": "Completion dips (bad attempt), then recovers (good attempt). Shows non-stationary reliability.",
@@ -756,7 +769,6 @@ def render_examples():
 
     other_examples: List[Dict[str, Any]] = []
 
-    # B1) Car vs Bicycle commute (analogy)
     other_examples.append({
         "title": "B1) Commute analogy: Car vs Bicycle",
         "story": "Car predicted comfy and fast; bicycle predicted slower but pleasant. Observations can flip the story if traffic hits.",
@@ -767,7 +779,7 @@ def render_examples():
                 "m_obs":  {"Efficiency": 0.85, "Comfort": 0.80, "TaskCompletion": 1.0},
                 "m_obs_schedule": [
                     {"t": 0, "Efficiency": 0.85, "Comfort": 0.80, "TaskCompletion": 1.0},
-                    {"t": 15, "Efficiency": 0.40, "Comfort": 0.55}  # traffic jam
+                    {"t": 15, "Efficiency": 0.40, "Comfort": 0.55}
                 ]
             },
             {
@@ -778,7 +790,6 @@ def render_examples():
         ]
     })
 
-    # B2) Spain vs China travel (analogy)
     other_examples.append({
         "title": "B2) Travel analogy: Spain vs China (jetlag hits at t=5)",
         "story": "Both trips complete, but comfort drops for long-haul travel due to jetlag and language friction.",
@@ -800,7 +811,6 @@ def render_examples():
         ]
     })
 
-    # B3) New job onboarding (single policy)
     other_examples.append({
         "title": "B3) Single policy: New job onboarding (confidence grows)",
         "story": "One policy only. Starts uncomfortable, then comfort increases after iteration 20 (you get used to it).",
@@ -817,7 +827,6 @@ def render_examples():
         ]
     })
 
-    # B4) Public speaking (single policy)
     other_examples.append({
         "title": "B4) Single policy: Public speaking (stress accumulation)",
         "story": "Performance is okay, but comfort erodes over repeated exposure (unless you model training).",
@@ -836,7 +845,6 @@ def render_examples():
         ]
     })
 
-    # B5) Laptop purchase (analogy: Mac vs Gaming PC)
     other_examples.append({
         "title": "B5) Buying analogy: Mac vs Gaming PC",
         "story": "Mac predicted high comfort, moderate efficiency. PC predicted high efficiency but lower comfort (noise/heat).",
@@ -854,10 +862,9 @@ def render_examples():
         ]
     })
 
-    # B6) Robot navigation policy: safe detour vs risky shortcut (analogy)
     other_examples.append({
         "title": "B6) Robot navigation analogy: SafeDetour vs RiskyShortcut",
-        "story": "Shortcut is predicted efficient; observed comfort/safety collapses (think near-misses) even if completion stays high.",
+        "story": "Shortcut is predicted efficient; observed comfort collapses even if completion stays high.",
         "json": [
             {
                 "name": "SafeDetour",
@@ -872,7 +879,6 @@ def render_examples():
         ]
     })
 
-    # B7) Single policy: cloud offloading (network outage)
     other_examples.append({
         "title": "B7) Single policy: Cloud offload (network outage at t=18)",
         "story": "Looks great until network quality collapses; efficiency and completion take a hit at t=18.",
@@ -889,10 +895,9 @@ def render_examples():
         ]
     })
 
-    # B8) Diet vs Workout (analogy)
     other_examples.append({
         "title": "B8) Lifestyle analogy: Diet vs Workout",
-        "story": "Workout predicted efficient for results but low comfort initially; comfort improves later with habit formation.",
+        "story": "Workout predicted efficient but low comfort initially; comfort improves later with habit formation.",
         "json": [
             {
                 "name": "DietPlan",
@@ -911,7 +916,6 @@ def render_examples():
         ]
     })
 
-    # B9) Single policy: meditation (slow improvement)
     other_examples.append({
         "title": "B9) Single policy: Meditation (comfort rises slowly)",
         "story": "Predicted modest benefits; observed comfort gradually rises (habit).",
@@ -929,7 +933,6 @@ def render_examples():
         ]
     })
 
-    # B10) Electric scooter vs walking (analogy)
     other_examples.append({
         "title": "B10) Micro-mobility analogy: E-scooter vs Walking",
         "story": "Scooter predicted efficient and comfortable; comfort drops due to rain and bumps at t=12.",
@@ -1011,6 +1014,9 @@ def render_simulator():
             adapt = st.checkbox("Enable weight calibration", value=True)
             phi = st.slider("φ (learning rate)", 0.0, 1.0, 0.10, 0.01)
 
+            # NEW: Rigidity slider
+            rigidity = st.slider("Rigidity r (1=stubborn, 0=flexible)", 0.0, 1.0, 0.50, 0.01)
+
         with st.expander("Policies (JSON editor)", expanded=True):
             if st.session_state.policies_json is None:
                 st.session_state.policies_json = default_policies_json(meta_names)
@@ -1047,6 +1053,7 @@ def render_simulator():
         p_match_D=float(p_match_D),
         gamma=float(gamma),
         phi=float(phi),
+        rigidity=float(rigidity),  # NEW
         adapt=bool(adapt),
     )
 
